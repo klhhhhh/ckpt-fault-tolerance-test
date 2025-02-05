@@ -20,7 +20,7 @@ class DummyDataset(Dataset):
         return self.inputs["input_ids"][0], self.inputs["attention_mask"][0]
 
 # **保存 Checkpoint**
-def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, mode="sync", executor=None):
+def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, mode="sync", executor=None, step):
     """
     每个 GPU 只保存自己负责的部分参数、optimizer 状态、gradient，支持 Sync & Async，支持 FP32 & FP16，支持 CUDA Core & Tensor Core。
     """
@@ -72,7 +72,7 @@ def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_ten
             "gradients": partial_gradients,
             "rank": rank,
             "world_size": world_size,
-        }, checkpoint_path))
+        }, checkpoint_path)
 
     checkpoint_time = time.time() - start_time
     print(f"[GPU {rank}] Checkpoint saved at {checkpoint_path} (mode={mode}, precision={precision}, tensor_core={use_tensor_core}, time={checkpoint_time:.2f}s)")
@@ -113,14 +113,13 @@ def load_full_checkpoint(model, optimizer, checkpoint_dir, accelerator):
                 param.grad = full_gradients[name].to(param.device)
 
         load_time = time.time() - start_time
-        print(f"[GPU {rank}] Full checkpoint loaded successfully! Load time: {load_time:.2f}s")
+        print(f"[GPU {rank}] [Step {step}] Full checkpoint loaded successfully! Load time: {load_time:.2f}s")
 
 # **训练 & Checkpoint**
 def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_dir, checkpoint_interval, mode="sync", precision="fp32", use_tensor_core=False):
     """
     训练时，每个 GPU 只存储自己负责的部分参数，支持 Sync & Async，支持 FP32 & FP16，支持 CUDA Core & Tensor Core。
     """
-    total_steps = 100
     executor = ThreadPoolExecutor(max_workers=1) if mode == "async" else None
 
     total_train_time = 0
@@ -129,8 +128,6 @@ def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_d
     start_train_time = time.time()
     
     for step, (input_ids, attention_mask) in enumerate(dataloader):
-        if step >= total_steps:
-            break
 
         input_ids = input_ids.to(accelerator.device)
         attention_mask = attention_mask.to(accelerator.device)
@@ -144,7 +141,7 @@ def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_d
         optimizer.step()
 
         if step % checkpoint_interval == 0 and step > 0:
-            total_checkpoint_time += save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, mode, executor)
+            total_checkpoint_time += save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, mode, executor, step)
 
     total_train_time = time.time() - start_train_time
 
@@ -162,7 +159,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(model_name)
 
     # **Dataloader**
-    dataset = DummyDataset(tokenizer, length=500)
+    dataset = DummyDataset(tokenizer, length=2000)
     dataloader = DataLoader(dataset, batch_size=4)
 
     # **Optimizer**
