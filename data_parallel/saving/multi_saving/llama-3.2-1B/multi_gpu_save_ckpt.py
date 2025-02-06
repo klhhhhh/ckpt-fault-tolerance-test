@@ -20,7 +20,7 @@ class DummyDataset(Dataset):
         return self.inputs["input_ids"][0], self.inputs["attention_mask"][0]
 
 # **保存 Checkpoint**
-def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, mode="sync", executor=None, step):
+def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, step, mode="sync", executor=None):
     """
     每个 GPU 只保存自己负责的部分参数、optimizer 状态、gradient，支持 Sync & Async，支持 FP32 & FP16，支持 CUDA Core & Tensor Core。
     """
@@ -75,7 +75,7 @@ def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_ten
         }, checkpoint_path)
 
     checkpoint_time = time.time() - start_time
-    print(f"[GPU {rank}] Checkpoint saved at {checkpoint_path} (mode={mode}, precision={precision}, tensor_core={use_tensor_core}, time={checkpoint_time:.2f}s)")
+    print(f"[GPU {rank}]  [Step {step}] Checkpoint saved at {checkpoint_path} (mode={mode}, precision={precision}, tensor_core={use_tensor_core}, time={checkpoint_time:.2f}s)")
     return checkpoint_time
 
 # **加载 Checkpoint**
@@ -113,7 +113,7 @@ def load_full_checkpoint(model, optimizer, checkpoint_dir, accelerator):
                 param.grad = full_gradients[name].to(param.device)
 
         load_time = time.time() - start_time
-        print(f"[GPU {rank}] [Step {step}] Full checkpoint loaded successfully! Load time: {load_time:.2f}s")
+        print(f"[GPU {rank}] Full checkpoint loaded successfully! Load time: {load_time:.2f}s")
 
 # **训练 & Checkpoint**
 def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_dir, checkpoint_interval, mode="sync", precision="fp32", use_tensor_core=False):
@@ -141,9 +141,12 @@ def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_d
         optimizer.step()
 
         if step % checkpoint_interval == 0 and step > 0:
-            total_checkpoint_time += save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, mode, executor, step)
+            total_checkpoint_time += save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, step, mode, executor)
 
     total_train_time = time.time() - start_train_time
+
+    if mode == "async":
+        executor.shutdown(wait=True)
 
     if accelerator.is_local_main_process:
         print(f"Training completed. Mode: {mode}, Precision: {precision}, Tensor Core: {use_tensor_core}")

@@ -1,1 +1,2 @@
 accelerate launch --multi_gpu --main_process_ip nid200369 --machine_rank 0 /global/homes/k/klhhhhh/checkpoint_test/load_checkpoint.py
+accelerate launch --multi_gpu --main_process_ip nid200416 --machine_rank 0 /global/homes/k/klhhhhh/ckpt-fault-tolerance-test/data_parallel/saving/multi_saving/llama-3.2-1B/multi_gpu_save_ckpt.py
