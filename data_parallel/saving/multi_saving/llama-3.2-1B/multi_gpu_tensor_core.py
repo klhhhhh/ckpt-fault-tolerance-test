@@ -20,11 +20,11 @@ class DummyDataset(Dataset):
         return self.inputs["input_ids"][0], self.inputs["attention_mask"][0]
 
 # **保存 Checkpoint**
-def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, step, mode="sync", executor=None):
+def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, accelerator, step, mode="sync", executor=None):
     """
     每个 GPU 只保存自己负责的部分参数、optimizer 状态、gradient，支持 Sync & Async，支持 FP32 & FP16，支持 CUDA Core & Tensor Core。
     """
-    rank = accelerator.state.local_process_index
+    rank = accelerator.state.process_index
     world_size = accelerator.state.num_processes
 
     # 获取完整的 state_dict
@@ -33,6 +33,9 @@ def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_ten
 
     # **按 rank 进行切分**
     model_keys = list(full_model_state.keys())
+    if rank == 0:
+        print(model_keys)
+
     optimizer_keys = list(full_optimizer_state["state"].keys())
 
     split_model_keys = model_keys[rank::world_size]
@@ -57,31 +60,32 @@ def save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_ten
     start_time = time.time()
 
     # **Sync & Async**
-    if mode == "sync":
-        torch.save({
-            "model_state_dict": partial_model_state,
-            "optimizer_state_dict": partial_optimizer_state,
-            "gradients": partial_gradients,
-            "rank": rank,
-            "world_size": world_size,
-        }, checkpoint_path)
-    elif mode == "async":
-        executor.submit(torch.save, {
-            "model_state_dict": partial_model_state,
-            "optimizer_state_dict": partial_optimizer_state,
-            "gradients": partial_gradients,
-            "rank": rank,
-            "world_size": world_size,
-        }, checkpoint_path)
+    with torch.cuda.amp.autocast(dtype=torch.float16):
+        if mode == "sync":
+            torch.save({
+                "model_state_dict": partial_model_state,
+                "optimizer_state_dict": partial_optimizer_state,
+                "gradients": partial_gradients,
+                "rank": rank,
+                "world_size": world_size,
+            }, checkpoint_path)
+        elif mode == "async":
+            executor.submit(torch.save, {
+                "model_state_dict": partial_model_state,
+                "optimizer_state_dict": partial_optimizer_state,
+                "gradients": partial_gradients,
+                "rank": rank,
+                "world_size": world_size,
+            }, checkpoint_path)
 
     checkpoint_time = time.time() - start_time
-    print(f"[GPU {rank}]  [Step {step}] Checkpoint saved at {checkpoint_path} (mode={mode}, precision={precision}, tensor_core={use_tensor_core}, time={checkpoint_time:.2f}s)")
+    print(f"[GPU {rank}]  [Step {step}] Checkpoint saved at {checkpoint_path} (mode={mode}, precision={precision}, time={checkpoint_time:.2f}s)")
     return checkpoint_time
 
 # **加载 Checkpoint**
 def load_full_checkpoint(model, optimizer, checkpoint_dir, accelerator):
     """
-    只在 `rank 0` 进程合并所有 Checkpoint 并恢复完整模型。
+    只在 `rank 0` 进程合并所有 Checkpoint 并恢复完整模型，确保梯度数据类型匹配。
     """
     rank = accelerator.state.local_process_index
     world_size = accelerator.state.num_processes
@@ -94,8 +98,10 @@ def load_full_checkpoint(model, optimizer, checkpoint_dir, accelerator):
         start_time = time.time()
 
         for i in range(world_size):
-            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_rank_{i}.pt")
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_process_{i}.pt")
+
+            # ✅ **修正 PyTorch 2.4+ 的 load()**
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
             full_model_state.update(checkpoint["model_state_dict"])
             full_optimizer_state.update(checkpoint["optimizer_state_dict"])
@@ -107,16 +113,17 @@ def load_full_checkpoint(model, optimizer, checkpoint_dir, accelerator):
         # **恢复 optimizer**
         optimizer.load_state_dict({"state": full_optimizer_state, "param_groups": optimizer.param_groups})
 
-        # **恢复梯度**
+        # ✅ **修正梯度数据类型**
         for name, param in model.named_parameters():
             if name in full_gradients:
-                param.grad = full_gradients[name].to(param.device)
+                param.grad = full_gradients[name].to(param.dtype).to(param.device)  # ✅ 确保 dtype 和 device 兼容
 
         load_time = time.time() - start_time
         print(f"[GPU {rank}] Full checkpoint loaded successfully! Load time: {load_time:.2f}s")
 
+
 # **训练 & Checkpoint**
-def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_dir, checkpoint_interval, mode="sync", precision="fp32", use_tensor_core=False):
+def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_dir, checkpoint_interval, mode="sync", precision="fp32"):
     """
     训练时，每个 GPU 只存储自己负责的部分参数，支持 Sync & Async，支持 FP32 & FP16，支持 CUDA Core & Tensor Core。
     """
@@ -133,7 +140,7 @@ def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_d
         attention_mask = attention_mask.to(accelerator.device)
 
         optimizer.zero_grad()
-        with accelerator.autocast(dtype=torch.float16 if use_tensor_core else torch.float32):
+        with accelerator.autocast():
             outputs = model(input_ids, attention_mask=attention_mask, labels=input_ids)
             loss = outputs.loss
 
@@ -141,7 +148,7 @@ def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_d
         optimizer.step()
 
         if step % checkpoint_interval == 0 and step > 0:
-            total_checkpoint_time += save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, use_tensor_core, accelerator, step, mode, executor)
+            total_checkpoint_time += save_partial_checkpoint(model, optimizer, checkpoint_dir, precision, accelerator, step, mode, executor)
 
     total_train_time = time.time() - start_train_time
 
@@ -149,7 +156,7 @@ def train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_d
         executor.shutdown(wait=True)
 
     if accelerator.is_local_main_process:
-        print(f"Training completed. Mode: {mode}, Precision: {precision}, Tensor Core: {use_tensor_core}")
+        print(f"Training completed. Mode: {mode}, Precision: {precision}, Tensor Core")
         print(f"Total training time: {total_train_time:.2f}s")
         print(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
 
@@ -178,8 +185,7 @@ if __name__ == "__main__":
     # **执行不同模式的训练**
     for mode in ["sync", "async"]:
         for precision in ["fp32", "fp16"]:
-            for use_tensor_core in [False, True]:
-                train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_dir, checkpoint_interval=10, mode=mode, precision=precision, use_tensor_core=use_tensor_core)
+            train_and_checkpoint(model, dataloader, optimizer, accelerator, checkpoint_dir, checkpoint_interval=10, mode=mode, precision=precision)
 
     # **加载完整 Checkpoint**
     load_full_checkpoint(model, optimizer, checkpoint_dir, accelerator)
