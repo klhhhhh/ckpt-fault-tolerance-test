@@ -96,15 +96,16 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
 if __name__ == "__main__":
     # ✅ **DeepSpeed 配置**
     deepspeed_config = {
-        "train_batch_size": 8,
-        "gradient_accumulation_steps": 1,
+        "train_batch_size": 256,
+        "train_micro_batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 2,
         "zero_optimization": {
             "stage": 3,  # ✅ ZeRO-3: 全局参数分片
-            "offload_optimizer": {"device": "cpu"},  # ✅ 可选: Offload optimizer 到 CPU
-            "offload_param": {"device": "cpu"},  # ✅ 可选: Offload 参数到 CPU
+            # "offload_optimizer": {"device": "cpu"},  # ✅ 可选: Offload optimizer 到 CPU
+            # "offload_param": {"device": "cpu"},  # ✅ 可选: Offload 参数到 CPU
             "contiguous_gradients": True,  # ✅ 使梯度内存分配更高效
         },
-        "fp16": {"enabled": True},  # ✅ 训练时启用 FP16
+        "bf16": {"enabled": True},  # ✅ 训练时启用 FP16
     }
 
     # ✅ **初始化模型**

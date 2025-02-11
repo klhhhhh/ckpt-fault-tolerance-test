@@ -1,10 +1,18 @@
 import os
 import torch
+import torch.distributed as dist
 import deepspeed
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from concurrent.futures import ThreadPoolExecutor
 import time
+
+# # ✅ **初始化分布式训练**
+# if not dist.is_initialized():
+#     dist.init_process_group(backend="nccl")
+
+# rank = dist.get_rank()
+# print(f"[RANK {rank}] Initialized torch.distributed")
 
 # ✅ **Dummy Dataset**
 class DummyDataset(Dataset):
@@ -21,14 +29,8 @@ class DummyDataset(Dataset):
 
 # ✅ **DeepSpeed Checkpoint Save**
 def save_checkpoint(engine, checkpoint_dir, step, mode="sync", executor=None):
-    """
-    Save checkpoint using DeepSpeed, supporting both Sync & Async modes.
-    - ✅ ZeRO-3 automatically saves sharded model parameters, optimizer states, and gradients.
-    - ✅ No need to manually save gradients, DeepSpeed manages it automatically.
-    """
-    rank = engine.local_rank  # Get GPU process ID
+    rank = engine.local_rank
     start_time = time.time()
-
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
 
     if mode == "sync":
@@ -42,24 +44,16 @@ def save_checkpoint(engine, checkpoint_dir, step, mode="sync", executor=None):
 
 # ✅ **DeepSpeed Checkpoint Load**
 def load_checkpoint(engine, checkpoint_dir):
-    """
-    DeepSpeed automatically restores model parameters, optimizer states, and gradients (sharded by ZeRO-3).
-    """
-    rank = engine.local_rank  # Current GPU rank
+    rank = engine.local_rank
     start_time = time.time()
-
-    latest_ckpt = sorted(os.listdir(checkpoint_dir))[-1]  # Select the latest checkpoint
+    latest_ckpt = sorted(os.listdir(checkpoint_dir))[-1]
     checkpoint_path = os.path.join(checkpoint_dir, latest_ckpt)
-    engine.load_checkpoint(checkpoint_path)  # ✅ Automatically restore model, optimizer, and gradients
-
+    engine.load_checkpoint(checkpoint_path)
     load_time = time.time() - start_time
     print(f"[GPU {rank}] Checkpoint loaded from {checkpoint_path} in {load_time:.2f}s")
 
 # ✅ **Training & Checkpointing**
 def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, mode="sync"):
-    """
-    During training, each GPU only saves the parameters it is responsible for, supporting both Sync & Async modes, and ZeRO-3.
-    """
     executor = ThreadPoolExecutor(max_workers=1) if mode == "async" else None
     total_train_time = 0
     total_checkpoint_time = 0
@@ -71,14 +65,13 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
         attention_mask = attention_mask.to(engine.device)
 
         engine.zero_grad()
-        with torch.cuda.amp.autocast(dtype=torch.float16):  # ✅ Enable Tensor Core training
+        with torch.cuda.amp.autocast(dtype=torch.float16):
             outputs = engine.module(input_ids, attention_mask=attention_mask, labels=input_ids)
             loss = outputs.loss
 
         engine.backward(loss)
         engine.step()
 
-        # ✅ **Periodically save checkpoint**
         if step % checkpoint_interval == 0 and step > 0:
             total_checkpoint_time += save_checkpoint(engine, checkpoint_dir, step, mode, executor)
 
@@ -94,15 +87,20 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
 if __name__ == "__main__":
     # ✅ **DeepSpeed Configuration**
     deepspeed_config = {
-        "train_batch_size": 8,
-        "gradient_accumulation_steps": 1,
+        "train_batch_size": 512,
+        "train_micro_batch_size_per_gpu": 16,
+        "gradient_accumulation_steps": 2,
         "zero_optimization": {
-            "stage": 3,  # ✅ ZeRO-3: Each GPU only saves its own parameters, optimizer states, and gradients
-            # "offload_optimizer": {"device": "cpu"},
-            # "offload_param": {"device": "cpu"},  # ✅ Optional: Offload parameters to CPU
-            "contiguous_gradients": True,  # ✅ Make gradient memory allocation more efficient
+            "stage": 3,
+            "contiguous_gradients": True,
+            # "offload_optimizer": {
+            #     "device": "cpu",
+            # },
+            # "offload_param": {
+            #     "device": "cpu"
+            # },
         },
-        "fp16": {"enabled": True},  # ✅ Enable FP16 training
+        "bf16": {"enabled": True}
     }
 
     # ✅ **Initialize Model**
@@ -112,7 +110,7 @@ if __name__ == "__main__":
 
     # ✅ **Dataloader**
     dataset = DummyDataset(tokenizer, length=2000)
-    dataloader = DataLoader(dataset, batch_size=4)
+    dataloader = DataLoader(dataset, batch_size=16)
 
     # ✅ **Optimizer**
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
@@ -126,9 +124,8 @@ if __name__ == "__main__":
     checkpoint_dir = "/pscratch/sd/k/klhhhhh/deepspeed_checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # ✅ **Execute Training in Different Modes**
-    for mode in ["sync", "async"]:
-        train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, mode=mode)
+    # ✅ **Execute Training**
+    train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, mode="sync")
 
     # ✅ **Load the Latest Checkpoint**
     load_checkpoint(model, checkpoint_dir)
