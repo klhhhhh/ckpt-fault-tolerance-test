@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import torch.distributed as dist
 import deepspeed
@@ -6,13 +7,30 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from concurrent.futures import ThreadPoolExecutor
 import time
+import logging
 
-# # ✅ **初始化分布式训练**
-# if not dist.is_initialized():
-#     dist.init_process_group(backend="nccl")
+# ✅ **日志配置**
+def setup_logging():
+    # 1. 创建自己的 Logger
+    my_logger = logging.getLogger("my_logger")
+    my_logger.setLevel(logging.INFO)
+    my_handler = logging.FileHandler("my_logs.log")
+    my_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    my_logger.addHandler(my_handler)
 
-# rank = dist.get_rank()
-# print(f"[RANK {rank}] Initialized torch.distributed")
+    # 2. 创建 DeepSpeed Logger
+    ds_logger = logging.getLogger("deepspeed")
+    ds_logger.setLevel(logging.INFO)
+    ds_handler = logging.FileHandler("deepspeed_logs.log")
+    ds_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    ds_logger.addHandler(ds_handler)
+    ds_logger.propagate = False  # 防止 DeepSpeed 日志冒泡到 root logger
+
+    # 3. PyTorch 分布式日志 (可选)
+    torch_logger = logging.getLogger("torch.distributed")
+    torch_logger.setLevel(logging.WARNING)  # 只记录警告及以上级别的日志
+
+    return my_logger
 
 # ✅ **Dummy Dataset**
 class DummyDataset(Dataset):
@@ -39,7 +57,7 @@ def save_checkpoint(engine, checkpoint_dir, step, mode="sync", executor=None):
         executor.submit(engine.save_checkpoint, checkpoint_path)
 
     checkpoint_time = time.time() - start_time
-    print(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} (mode={mode}, time={checkpoint_time:.2f}s)")
+    my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} (mode={mode}, time={checkpoint_time:.2f}s)")
     return checkpoint_time
 
 # ✅ **DeepSpeed Checkpoint Load**
@@ -50,7 +68,7 @@ def load_checkpoint(engine, checkpoint_dir):
     checkpoint_path = os.path.join(checkpoint_dir, latest_ckpt)
     engine.load_checkpoint(checkpoint_path)
     load_time = time.time() - start_time
-    print(f"[GPU {rank}] Checkpoint loaded from {checkpoint_path} in {load_time:.2f}s")
+    my_logger.info(f"[GPU {rank}] Checkpoint loaded from {checkpoint_path} in {load_time:.2f}s")
 
 # ✅ **Training & Checkpointing**
 def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, mode="sync"):
@@ -80,11 +98,14 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
     if mode == "async":
         executor.shutdown(wait=True)
 
-    print(f"Training completed. Mode: {mode}, ZeRO-3 Enabled, Tensor Core: Enabled")
-    print(f"Total training time: {total_train_time:.2f}s")
-    print(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
+    my_logger.info(f"Training completed. Mode: {mode}, ZeRO-3 Enabled, Tensor Core: Enabled")
+    my_logger.info(f"Total training time: {total_train_time:.2f}s")
+    my_logger.info(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
 
 if __name__ == "__main__":
+    # ✅ **设置日志**
+    my_logger = setup_logging()
+
     # ✅ **DeepSpeed Configuration**
     deepspeed_config = {
         "train_batch_size": 512,
@@ -93,13 +114,8 @@ if __name__ == "__main__":
         "zero_optimization": {
             "stage": 3,
             "contiguous_gradients": True,
-            # "offload_optimizer": {
-            #     "device": "cpu",
-            # },
-            # "offload_param": {
-            #     "device": "cpu"
-            # },
         },
+        "logging": {"verbosity": 0},
         "bf16": {"enabled": True}
     }
 
