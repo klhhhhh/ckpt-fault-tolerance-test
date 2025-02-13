@@ -12,33 +12,41 @@ import time
 # 禁止 Hugging Face 的 Tokenizer 并行，防止 `fork()` 错误
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ✅ **获取 `NODE_RANK`**
 def get_node_rank():
     """获取 DeepSpeed / torch.distributed 的 node rank"""
     if dist.is_initialized():
-        return dist.get_rank()
-    return int(os.environ.get("RANK", -1))  # `RANK` 代表当前节点编号
+        return dist.get_rank()  # 分布式训练时的全局 rank
+    return int(os.environ.get("RANK", -1))  # 从环境变量获取
 
+def get_local_rank():
+    """获取 GPU 本地 rank"""
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"])
+    return 0  # 默认 0 号 GPU
 
-# ✅ **日志配置**
 class LogFormatter(logging.Formatter):
-    """自定义日志格式，添加 `NODE_RANK`"""
+    """自定义日志格式，添加 `NODE_RANK` 和 `LOCAL_RANK`"""
     def format(self, record):
         record.node_rank = get_node_rank()
+        record.local_rank = get_local_rank()
         return super().format(record)
 
-
 def setup_logging():
-    """设置日志系统，确保日志带有 `NODE_RANK`"""
-    my_logger = logging.getLogger("my_logger")
+    """设置日志系统，每个进程独立写入日志文件，避免并行写入冲突"""
+    node_rank = get_node_rank()
+    local_rank = get_local_rank()
+
+    my_logger = logging.getLogger(f"my_logger_{node_rank}_{local_rank}")  # 每个 GPU 进程单独 logger
     my_logger.setLevel(logging.INFO)
 
-    # 日志格式：带 `NODE_RANK`
-    log_format = "%(asctime)s - Node: %(node_rank)s - %(levelname)s - %(message)s"
-    formatter = LogFormatter(log_format)
+    # 生成唯一日志文件，防止并行写冲突
+    log_filename = f"my_logs_node{node_rank}_gpu{local_rank}.log"
 
-    # 日志写入文件
-    my_handler = logging.FileHandler("my_logs_tensor_core.log", mode="w")
+    # ✅ 以 "w" 模式打开，确保每次运行时覆盖
+    my_handler = logging.FileHandler(log_filename, mode="w")
+    log_format = "%(asctime)s - Node: %(node_rank)s - GPU: %(local_rank)s - %(levelname)s - %(message)s"
+    formatter = LogFormatter(log_format)
+    
     my_handler.setFormatter(formatter)
     my_logger.addHandler(my_handler)
 
