@@ -40,7 +40,7 @@ def setup_logging():
     my_logger.setLevel(logging.INFO)
 
     # 生成唯一日志文件，防止并行写冲突
-    log_filename = f"my_logs_node{node_rank}_gpu{local_rank}.log"
+    log_filename = f"./logs/my_logs_node{node_rank}_gpu{local_rank}.log"
 
     # ✅ 以 "w" 模式打开，确保每次运行时覆盖
     my_handler = logging.FileHandler(log_filename, mode="w")
