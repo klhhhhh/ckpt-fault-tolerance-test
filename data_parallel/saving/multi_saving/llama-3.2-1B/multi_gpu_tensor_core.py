@@ -3,32 +3,44 @@ import sys
 import torch
 import torch.distributed as dist
 import deepspeed
+import logging
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from concurrent.futures import ThreadPoolExecutor
 import time
-import logging
+
+# 禁止 Hugging Face 的 Tokenizer 并行，防止 `fork()` 错误
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# ✅ **获取 `NODE_RANK`**
+def get_node_rank():
+    """获取 DeepSpeed / torch.distributed 的 node rank"""
+    if dist.is_initialized():
+        return dist.get_rank()
+    return int(os.environ.get("RANK", -1))  # `RANK` 代表当前节点编号
+
 
 # ✅ **日志配置**
+class LogFormatter(logging.Formatter):
+    """自定义日志格式，添加 `NODE_RANK`"""
+    def format(self, record):
+        record.node_rank = get_node_rank()
+        return super().format(record)
+
+
 def setup_logging():
-    # 1. 创建自己的 Logger
+    """设置日志系统，确保日志带有 `NODE_RANK`"""
     my_logger = logging.getLogger("my_logger")
     my_logger.setLevel(logging.INFO)
-    my_handler = logging.FileHandler("my_logs.log")
-    my_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
+    # 日志格式：带 `NODE_RANK`
+    log_format = "%(asctime)s - Node: %(node_rank)s - %(levelname)s - %(message)s"
+    formatter = LogFormatter(log_format)
+
+    # 日志写入文件
+    my_handler = logging.FileHandler("my_logs_tensor_core.log", mode="w")
+    my_handler.setFormatter(formatter)
     my_logger.addHandler(my_handler)
-
-    # 2. 创建 DeepSpeed Logger
-    ds_logger = logging.getLogger("deepspeed")
-    ds_logger.setLevel(logging.INFO)
-    ds_handler = logging.FileHandler("deepspeed_logs.log")
-    ds_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    ds_logger.addHandler(ds_handler)
-    ds_logger.propagate = False  # 防止 DeepSpeed 日志冒泡到 root logger
-
-    # 3. PyTorch 分布式日志 (可选)
-    torch_logger = logging.getLogger("torch.distributed")
-    torch_logger.setLevel(logging.WARNING)  # 只记录警告及以上级别的日志
 
     return my_logger
 
@@ -61,17 +73,17 @@ def save_checkpoint(engine, checkpoint_dir, step, mode="sync", executor=None):
     return checkpoint_time
 
 # ✅ **DeepSpeed Checkpoint Load**
-def load_checkpoint(engine, checkpoint_dir):
+def load_checkpoint(engine, checkpoint_dir, mode):
     rank = engine.local_rank
     start_time = time.time()
     latest_ckpt = sorted(os.listdir(checkpoint_dir))[-1]
     checkpoint_path = os.path.join(checkpoint_dir, latest_ckpt)
     engine.load_checkpoint(checkpoint_path)
     load_time = time.time() - start_time
-    my_logger.info(f"[GPU {rank}] Checkpoint loaded from {checkpoint_path} in {load_time:.2f}s")
+    my_logger.info(f"[GPU {rank}] {mode} Checkpoint loaded from {checkpoint_path} in {load_time:.2f}s")
 
 # ✅ **Training & Checkpointing**
-def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, mode="sync"):
+def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, mode="sync"):
     executor = ThreadPoolExecutor(max_workers=1) if mode == "async" else None
     total_train_time = 0
     total_checkpoint_time = 0
@@ -83,7 +95,7 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
         attention_mask = attention_mask.to(engine.device)
 
         engine.zero_grad()
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.cuda.amp.autocast(dtype=dtype):
             outputs = engine.module(input_ids, attention_mask=attention_mask, labels=input_ids)
             loss = outputs.loss
 
@@ -116,7 +128,8 @@ if __name__ == "__main__":
             "contiguous_gradients": True,
         },
         "logging": {"verbosity": 0},
-        "bf16": {"enabled": True}
+        "bf16": {"enabled": False},
+        "fp16": {"enabled": False}
     }
 
     # ✅ **Initialize Model**
@@ -131,17 +144,48 @@ if __name__ == "__main__":
     # ✅ **Optimizer**
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
+    # ✅ **Checkpoint Directory**
+    checkpoint_dir = "/pscratch/sd/k/klhhhhh/deepspeed_checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    if get_node_rank() == 0:
+        my_logger.info("Percision: BF16, ZeRO-3: Enabled, Tensor Core: Enabled, Training started.")
+    
+    deepspeed_config["fp16"]["enabled"] = False
+    deepspeed_config["bf16"]["enabled"] = True
+    # ✅ **DeepSpeed Initialization**
+    model, optimizer, _, _ = deepspeed.initialize(
+        model=model, optimizer=optimizer, config_params=deepspeed_config
+    )
+    
+    for mode in ["sync", "async"]:
+        # ✅ **Training & Checkpointing**
+        train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=torch.bfloat16, mode=mode)
+
+        # ✅ **Load the Latest Checkpoint**
+        load_checkpoint(model, checkpoint_dir)
+    
+    if get_node_rank() == 0:
+        my_logger.info("Percision: FP16, ZeRO-3: Enabled, Tensor Core: Enabled, Training started.")
+    
+    deepspeed_config["fp16"]["enabled"] = True
+    deepspeed_config["bf16"]["enabled"] = False
     # ✅ **DeepSpeed Initialization**
     model, optimizer, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, config_params=deepspeed_config
     )
 
-    # ✅ **Checkpoint Directory**
-    checkpoint_dir = "/pscratch/sd/k/klhhhhh/deepspeed_checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    for mode in ["sync", "async"]:
+        # ✅ **Training & Checkpointing**
+        train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=torch.float16, mode=mode)
 
-    # ✅ **Execute Training**
-    train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, mode="sync")
+        # ✅ **Load the Latest Checkpoint**
+        load_checkpoint(model, checkpoint_dir)
+    
 
-    # ✅ **Load the Latest Checkpoint**
-    load_checkpoint(model, checkpoint_dir)
+    # ✅ **清理 PyTorch 分布式进程**
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+    # ✅ **强制退出**
+    sys.exit(0)
