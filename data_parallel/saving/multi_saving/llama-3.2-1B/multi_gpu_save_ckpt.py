@@ -18,16 +18,22 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ✅ 获取 Node Rank 和 Local Rank
 def get_node_rank():
-    """获取 DeepSpeed / torch.distributed 的 node rank"""
-    if dist.is_initialized():
-        return dist.get_rank()
-    return int(os.environ.get("RANK", -1))  # 从环境变量获取
+    """获取当前节点的 Node Rank（在整个集群中的编号）"""
+    if "NODE_RANK" in os.environ:
+        return int(os.environ["NODE_RANK"])  # DeepSpeed / Torch Distributed 可能已设置
+    elif "WORLD_SIZE" in os.environ and "RANK" in os.environ:
+        num_nodes = int(os.environ.get("WORLD_SIZE", 1)) // torch.cuda.device_count()
+        return int(os.environ["RANK"]) // num_nodes  # 计算当前节点的编号
+    return 0  # 默认返回 0，单机情况
 
 def get_local_rank():
-    """获取 GPU 本地 rank"""
+    """获取当前 GPU 在本节点上的编号"""
     if "LOCAL_RANK" in os.environ:
-        return int(os.environ["LOCAL_RANK"])
-    return 0  # 默认 0 号 GPU
+        return int(os.environ["LOCAL_RANK"])  # DeepSpeed / Torch Distributed 设定
+    elif "RANK" in os.environ:
+        return int(os.environ["RANK"]) % torch.cuda.device_count()  # 计算 local rank
+    return 0  # 默认返回 0
+
 
 # ✅ 自定义日志格式，添加 `NODE_RANK`、`LOCAL_RANK`、`PRECISION`
 class LogFormatter(logging.Formatter):
@@ -157,8 +163,8 @@ if __name__ == "__main__":
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     deepspeed_config = {
-        "train_batch_size": 512,
-        "train_micro_batch_size_per_gpu": 16,
+        "train_batch_size": 256,
+        "train_micro_batch_size_per_gpu": 8,
         "gradient_accumulation_steps": 2,
         "zero_optimization": {
             "stage": 3,
