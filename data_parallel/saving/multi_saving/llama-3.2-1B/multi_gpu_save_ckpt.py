@@ -8,32 +8,10 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from concurrent.futures import ThreadPoolExecutor
 import time
-from multiprocessing import Lock
-
-# ✅ 全局日志锁，防止并行写入冲突
-log_lock = Lock()
+from multiprocessing import Manager
 
 # ✅ 禁止 Hugging Face 的 Tokenizer 并行，防止 `fork()` 错误
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# ✅ 获取 Node Rank 和 Local Rank
-def get_node_rank():
-    """获取当前节点的 Node Rank（在整个集群中的编号）"""
-    if "NODE_RANK" in os.environ:
-        return int(os.environ["NODE_RANK"])  # DeepSpeed / Torch Distributed 可能已设置
-    elif "WORLD_SIZE" in os.environ and "RANK" in os.environ:
-        num_nodes = int(os.environ.get("WORLD_SIZE", 1)) // torch.cuda.device_count()
-        return int(os.environ["RANK"]) // num_nodes  # 计算当前节点的编号
-    return 0  # 默认返回 0，单机情况
-
-def get_local_rank():
-    """获取当前 GPU 在本节点上的编号"""
-    if "LOCAL_RANK" in os.environ:
-        return int(os.environ["LOCAL_RANK"])  # DeepSpeed / Torch Distributed 设定
-    elif "RANK" in os.environ:
-        return int(os.environ["RANK"]) % torch.cuda.device_count()  # 计算 local rank
-    return 0  # 默认返回 0
-
 
 # ✅ 自定义日志格式，添加 `NODE_RANK`、`LOCAL_RANK`、`PRECISION`
 class LogFormatter(logging.Formatter):
@@ -55,11 +33,9 @@ def setup_logging(precision="FP32"):
     my_logger = logging.getLogger(f"my_logger_{node_rank}_{local_rank}")
     my_logger.setLevel(logging.INFO)
 
-    # ✅ 生成独立日志文件，避免多个 GPU 进程同时写入同一文件
     os.makedirs("./logs", exist_ok=True)
     log_filename = f"./logs/my_logs_node{node_rank}_gpu{local_rank}.log"
 
-    # ✅ 以 "w" 模式打开，确保每次运行时覆盖
     my_handler = logging.FileHandler(log_filename, mode="w")
     log_format = "%(asctime)s - Node: %(node_rank)s - GPU: %(local_rank)s - Precision: %(precision)s - %(levelname)s - %(message)s"
     formatter = LogFormatter(precision)
@@ -69,21 +45,8 @@ def setup_logging(precision="FP32"):
 
     return my_logger
 
-# ✅ Dummy Dataset
-class DummyDataset(Dataset):
-    def __init__(self, tokenizer, text="Hello world!", length=1000):
-        tokenizer.pad_token = tokenizer.eos_token
-        self.inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        self.length = length
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        return self.inputs["input_ids"][0], self.inputs["attention_mask"][0]
-
 # ✅ DeepSpeed Checkpoint Save
-def save_checkpoint(engine, checkpoint_dir, step, precision, mode="sync", executor=None):
+def save_checkpoint(engine, checkpoint_dir, step, precision, mode="sync", executor=None, log_lock=None, my_logger=None):
     rank = engine.local_rank
     start_time = time.time()
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
@@ -99,26 +62,12 @@ def save_checkpoint(engine, checkpoint_dir, step, precision, mode="sync", execut
     with log_lock:
         my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
                        f"(mode={mode}, Precision: {precision}, time={checkpoint_time:.2f}s)")
-        my_logger.handlers[0].flush()  # ✅ 立即写入日志
+        my_logger.handlers[0].flush()
 
     return checkpoint_time
 
-# ✅ DeepSpeed Checkpoint Load
-def load_checkpoint(engine, checkpoint_dir, mode):
-    rank = engine.local_rank
-    start_time = time.time()
-    latest_ckpt = sorted(os.listdir(checkpoint_dir))[-1]
-    checkpoint_path = os.path.join(checkpoint_dir, latest_ckpt)
-    engine.load_checkpoint(checkpoint_path)
-    load_time = time.time() - start_time
-
-    # ✅ 保护日志写入
-    with log_lock:
-        my_logger.info(f"[GPU {rank}] {mode} Checkpoint loaded from {checkpoint_path} in {load_time:.2f}s")
-        my_logger.handlers[0].flush()
-
 # ✅ Training & Checkpointing
-def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, mode="sync"):
+def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, mode="sync", log_lock=None, my_logger=None):
     executor = ThreadPoolExecutor(max_workers=1) if mode == "async" else None
     total_train_time = 0
     total_checkpoint_time = 0
@@ -138,7 +87,7 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
         engine.step()
 
         if step % checkpoint_interval == 0 and step > 0:
-            total_checkpoint_time += save_checkpoint(engine, checkpoint_dir, step, precision, mode, executor)
+            total_checkpoint_time += save_checkpoint(engine, checkpoint_dir, step, precision, mode, executor, log_lock, my_logger)
 
     total_train_time = time.time() - start_train_time
 
@@ -152,7 +101,12 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
         my_logger.info(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
         my_logger.handlers[0].flush()
 
+
 if __name__ == "__main__":
+    # ✅ 在 `if __name__ == "__main__"` 里创建锁，支持多进程共享
+    manager = Manager()
+    log_lock = manager.Lock()
+
     model_name = "/pscratch/sd/k/klhhhhh/Huggingface_model/Llama-3.2-1B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -182,8 +136,7 @@ if __name__ == "__main__":
         model, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config_params=deepspeed_config)
 
         for mode in ["sync", "async"]:
-            train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, mode=mode)
-            load_checkpoint(model, checkpoint_dir, mode)
+            train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, mode=mode, log_lock=log_lock, my_logger=my_logger)
 
     if dist.is_initialized():
         dist.destroy_process_group()
