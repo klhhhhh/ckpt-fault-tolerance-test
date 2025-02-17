@@ -10,8 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 from multiprocessing import Manager
 
-# ✅ 禁止 Hugging Face 的 Tokenizer 并行，防止 `fork()` 错误
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ✅ 自定义日志格式，添加 `NODE_RANK`、`LOCAL_RANK`、`PRECISION`
 class LogFormatter(logging.Formatter):
@@ -65,6 +63,26 @@ def save_checkpoint(engine, checkpoint_dir, step, precision, mode="sync", execut
         my_logger.handlers[0].flush()
 
     return checkpoint_time
+
+# ✅ DeepSpeed Checkpoint Load (增加加载时间测试)
+def load_checkpoint(engine, checkpoint_dir, precision, log_lock=None, my_logger=None):
+    """DeepSpeed 自动恢复模型参数、优化器状态和梯度，并测量加载时间"""
+    rank = engine.local_rank
+    start_time = time.time()
+
+    latest_ckpt = sorted(os.listdir(checkpoint_dir))[-1]  # 选择最新的 Checkpoint
+    checkpoint_path = os.path.join(checkpoint_dir, latest_ckpt)
+    engine.load_checkpoint(checkpoint_path)
+
+    load_time = time.time() - start_time
+
+    # ✅ 保护日志写入，防止行被截断
+    with log_lock:
+        my_logger.info(f"[GPU {rank}] Checkpoint loaded from {checkpoint_path} "
+                       f"(Precision: {precision}, Load Time: {load_time:.2f}s)")
+        my_logger.handlers[0].flush()
+
+    return load_time
 
 # ✅ Training & Checkpointing
 def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, mode="sync", log_lock=None, my_logger=None):
@@ -137,6 +155,14 @@ if __name__ == "__main__":
 
         for mode in ["sync", "async"]:
             train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, mode=mode, log_lock=log_lock, my_logger=my_logger)
+
+        # ✅ **新增：训练后立即加载 Checkpoint 并测量时间**
+        load_time = load_checkpoint(model, checkpoint_dir, precision, log_lock, my_logger)
+
+        # ✅ **日志记录**
+        with log_lock:
+            my_logger.info(f"Final Checkpoint Load Time: {load_time:.2f}s")
+            my_logger.handlers[0].flush()
 
     if dist.is_initialized():
         dist.destroy_process_group()
