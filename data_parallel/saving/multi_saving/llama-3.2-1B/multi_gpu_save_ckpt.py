@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from concurrent.futures import ThreadPoolExecutor
 import time
-from multiprocessing import Manager
+from multiprocessing import Manager, Process
 
 # ✅ Dummy Dataset
 class DummyDataset(Dataset):
@@ -100,26 +100,26 @@ def train_without_checkpoint(engine, dataloader, dtype, precision, log_lock=None
         my_logger.info(f"Total training time (No Checkpoint): {total_train_time:.2f}s")
         my_logger.handlers[0].flush()
 
-# ✅ DeepSpeed Checkpoint Save
-def save_checkpoint(engine, checkpoint_dir, step, precision, mode="sync", executor=None, log_lock=None, my_logger=None):
-    rank = engine.local_rank
-    start_time = time.time()
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
+# # ✅ DeepSpeed Checkpoint Save
+# def save_checkpoint(engine, checkpoint_dir, step, precision, mode="sync", executor=None, log_lock=None, my_logger=None):
+#     rank = engine.local_rank
+#     start_time = time.time()
+#     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
 
-    if mode == "sync":
-        engine.save_checkpoint(checkpoint_path)
-    elif mode == "async":
-        executor.submit(engine.save_checkpoint, checkpoint_path)
+#     if mode == "sync":
+#         engine.save_checkpoint(checkpoint_path)
+#     elif mode == "async":
+#         executor.submit(engine.save_checkpoint, checkpoint_path)
 
-    checkpoint_time = time.time() - start_time
+#     checkpoint_time = time.time() - start_time
 
-    # ✅ 保护日志写入
-    with log_lock:
-        my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
-                       f"(mode={mode}, Precision: {precision}, time={checkpoint_time:.2f}s)")
-        my_logger.handlers[0].flush()
+#     # ✅ 保护日志写入
+#     with log_lock:
+#         my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
+#                        f"(mode={mode}, Precision: {precision}, time={checkpoint_time:.2f}s)")
+#         my_logger.handlers[0].flush()
 
-    return checkpoint_time
+#     return checkpoint_time
 
 # ✅ DeepSpeed Checkpoint Load
 def load_checkpoint(engine, checkpoint_dir, precision, log_lock=None, my_logger=None):
@@ -141,13 +141,27 @@ def load_checkpoint(engine, checkpoint_dir, precision, log_lock=None, my_logger=
 
     return load_time
 
-# ✅ Training & Checkpointing
+# ✅ 进程异步存储 Checkpoint 的函数
+def save_checkpoint_process(engine, checkpoint_path):
+    """独立进程执行 DeepSpeed Checkpoint 存储"""
+    engine.save_checkpoint(checkpoint_path)
+
+def save_checkpoint_async(engine, checkpoint_dir, step):
+    """创建一个独立进程来存储 DeepSpeed Checkpoint"""
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
+
+    # ✅ 创建一个新的进程来执行 checkpoint 存储
+    p = Process(target=save_checkpoint_process, args=(engine, checkpoint_path))
+    p.start()  # 启动异步 checkpoint 进程
+
+    return p  # 返回进程对象，以便后续检查
+
+# ✅ Training & Checkpointing with Async Checkpoint
 def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, mode="sync", log_lock=None, my_logger=None):
-    executor = ThreadPoolExecutor(max_workers=1) if mode == "async" else None
-    total_train_time = 0
-    total_checkpoint_time = 0
+    checkpoint_processes = []  # 存储所有异步 checkpoint 进程
 
     start_train_time = time.time()
+    total_checkpoint_time = 0
 
     for step, (input_ids, attention_mask) in enumerate(dataloader):
         input_ids = input_ids.to(engine.device)
@@ -162,12 +176,32 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
         engine.step()
 
         if step % checkpoint_interval == 0 and step > 0:
-            total_checkpoint_time += save_checkpoint(engine, checkpoint_dir, step, precision, mode, executor, log_lock, my_logger)
+
+            checkpoint_start = time.time()
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
+
+            if mode == "async":
+                p = save_checkpoint_async(engine, checkpoint_dir, step)
+                checkpoint_processes.append(p)
+            else:
+                save_checkpoint_process(engine, checkpoint_path)
+            
+            checkpoint_time = time.time() - checkpoint_start
+            total_checkpoint_time += checkpoint_time
+
+            rank = engine.local_rank
+
+            with log_lock:
+                my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
+                            f"(mode={mode}, Precision: {precision}, time={checkpoint_time:.2f}s)")
+                my_logger.handlers[0].flush()
+
 
     total_train_time = time.time() - start_train_time
 
-    if mode == "async":
-        executor.shutdown(wait=True)
+    # ✅ 等待所有异步 checkpoint 进程完成
+    for p in checkpoint_processes:
+        p.join()
 
     # ✅ 保护日志写入
     with log_lock:
