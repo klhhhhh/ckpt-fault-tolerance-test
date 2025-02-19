@@ -4,13 +4,10 @@ import torch
 import torch.distributed as dist
 import deepspeed
 import logging
-import torch.multiprocessing as mp
-
+import time
+from multiprocessing import Manager
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from concurrent.futures import ThreadPoolExecutor
-import time
-from multiprocessing import Manager, Process
 
 # ✅ Dummy Dataset
 class DummyDataset(Dataset):
@@ -60,8 +57,8 @@ def setup_logging(precision="FP32"):
     my_logger = logging.getLogger(f"my_logger_{node_rank}_{local_rank}")
     my_logger.setLevel(logging.INFO)
 
-    os.makedirs(f"./logs/{precision}/", exist_ok=True)
-    log_filename = f"./logs/{precision}/my_logs_node{node_rank}_gpu{local_rank}.log"
+    os.makedirs(f"./logs/async_io/{precision}/", exist_ok=True)
+    log_filename = f"./logs/async_io/{precision}/my_logs_node{node_rank}_gpu{local_rank}.log"
 
     my_handler = logging.FileHandler(log_filename, mode="w")
     formatter = LogFormatter(precision)
@@ -94,7 +91,49 @@ def train_without_checkpoint(engine, dataloader, dtype, precision, log_lock=None
         my_logger.info(f"Total training time (No Checkpoint): {total_train_time:.2f}s")
         my_logger.handlers[0].flush()
 
-# ✅ DeepSpeed Checkpoint Load
+# ✅ 训练 + Checkpoint 逻辑
+def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, log_lock=None, my_logger=None):
+    start_train_time = time.time()
+    total_checkpoint_time = 0
+
+    for step, (input_ids, attention_mask) in enumerate(dataloader):
+        input_ids = input_ids.to(engine.device)
+        attention_mask = attention_mask.to(engine.device)
+
+        engine.zero_grad()
+        with torch.cuda.amp.autocast(dtype=dtype):
+            outputs = engine.module(input_ids, attention_mask=attention_mask, labels=input_ids)
+            loss = outputs.loss
+
+        engine.backward(loss)
+        engine.step()
+
+        # ✅ 触发 Checkpoint
+        if step % checkpoint_interval == 0 and step > 0:
+            checkpoint_start = time.time()
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
+            
+            # ✅ 直接调用 DeepSpeed 的 save_checkpoint（内部已支持 async_io）
+            engine.save_checkpoint(checkpoint_path)
+
+            checkpoint_time = time.time() - checkpoint_start
+            total_checkpoint_time += checkpoint_time
+
+            rank = engine.local_rank
+            with log_lock:
+                my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
+                               f"(Precision: {precision}, time={checkpoint_time:.2f}s)")
+                my_logger.handlers[0].flush()
+
+    total_train_time = time.time() - start_train_time
+
+    with log_lock:
+        my_logger.info(f"Training completed. Precision: {precision}")
+        my_logger.info(f"Total training time: {total_train_time:.2f}s")
+        my_logger.info(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
+        my_logger.handlers[0].flush()
+
+# ✅  DeepSpeed Checkpoint Load
 def load_checkpoint(engine, checkpoint_dir, precision, log_lock=None, my_logger=None):
     rank = engine.local_rank
     start_time = time.time()
@@ -112,75 +151,7 @@ def load_checkpoint(engine, checkpoint_dir, precision, log_lock=None, my_logger=
 
     return load_time
 
-# ✅ 进程异步存储 Checkpoint
-def save_checkpoint_process(state_dict, checkpoint_path):
-    """独立进程执行 DeepSpeed Checkpoint 存储"""
-    torch.save(state_dict, checkpoint_path)
-
-def save_checkpoint_async(engine, checkpoint_dir, step):
-    """创建一个独立进程来存储 DeepSpeed Checkpoint"""
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
-    
-    state_dict = engine.state_dict()  # ✅ 只传 state_dict，避免 pickle 问题
-    
-    p = Process(target=save_checkpoint_process, args=(state_dict, checkpoint_path))
-    p.start()
-    
-    return p
-
-# ✅ 训练 + Checkpoint 逻辑
-def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, mode="sync", log_lock=None, my_logger=None):
-    checkpoint_processes = []
-
-    start_train_time = time.time()
-    total_checkpoint_time = 0
-
-    for step, (input_ids, attention_mask) in enumerate(dataloader):
-        input_ids = input_ids.to(engine.device)
-        attention_mask = attention_mask.to(engine.device)
-
-        engine.zero_grad()
-        with torch.cuda.amp.autocast(dtype=dtype):
-            outputs = engine.module(input_ids, attention_mask=attention_mask, labels=input_ids)
-            loss = outputs.loss
-
-        engine.backward(loss)
-        engine.step()
-
-        if step % checkpoint_interval == 0 and step > 0:
-            checkpoint_start = time.time()
-            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}")
-
-            if mode == "async":
-                p = save_checkpoint_async(engine, checkpoint_dir, step)
-                checkpoint_processes.append(p)
-            else:
-                save_checkpoint_process(engine.state_dict(), checkpoint_path)
-
-            checkpoint_time = time.time() - checkpoint_start
-            total_checkpoint_time += checkpoint_time
-
-            rank = engine.local_rank
-
-            with log_lock:
-                my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
-                               f"(mode={mode}, Precision: {precision}, time={checkpoint_time:.2f}s)")
-                my_logger.handlers[0].flush()
-
-    total_train_time = time.time() - start_train_time
-
-    with log_lock:
-        my_logger.info(f"Training completed. Mode: {mode}, Precision: {precision}")
-        my_logger.info(f"Total training time: {total_train_time:.2f}s")
-        my_logger.info(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
-        my_logger.handlers[0].flush()
-
-    # ✅ 等待所有异步 checkpoint 进程完成
-    for p in checkpoint_processes:
-        p.join()
-
 if __name__ == "__main__":
-
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     manager = Manager()
@@ -218,10 +189,7 @@ if __name__ == "__main__":
         model, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config_params=deepspeed_config)
 
         train_without_checkpoint(model, dataloader, dtype, precision, log_lock, my_logger)
-
-        for mode in ["sync", "async"]:
-            train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, mode=mode, log_lock=log_lock, my_logger=my_logger)
-
+        train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, log_lock=log_lock, my_logger=my_logger)
         load_checkpoint(model, checkpoint_dir, precision, log_lock, my_logger)
 
     if dist.is_initialized():
