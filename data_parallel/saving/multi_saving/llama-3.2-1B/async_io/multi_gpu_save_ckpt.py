@@ -50,15 +50,15 @@ class LogFormatter(logging.Formatter):
         record.precision = self.precision  
         return super().format(record)
 
-def setup_logging(precision="FP32"):
+def setup_logging(precision="FP32", mode="sync"):
     node_rank = get_node_rank()
     local_rank = get_local_rank()
 
     my_logger = logging.getLogger(f"my_logger_{node_rank}_{local_rank}")
     my_logger.setLevel(logging.INFO)
 
-    os.makedirs(f"./logs/async_io/{precision}/", exist_ok=True)
-    log_filename = f"./logs/async_io/{precision}/my_logs_node{node_rank}_gpu{local_rank}.log"
+    os.makedirs(f"./logs/async_io/{mode}_{precision}/", exist_ok=True)
+    log_filename = f"./logs/async_io/{mode}_{precision}/my_logs_node{node_rank}_gpu{local_rank}.log"
 
     my_handler = logging.FileHandler(log_filename, mode="w")
     formatter = LogFormatter(precision)
