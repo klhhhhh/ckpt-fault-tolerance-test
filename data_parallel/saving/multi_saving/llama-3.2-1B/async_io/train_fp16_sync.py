@@ -39,6 +39,14 @@ if __name__ == "__main__":
         "zero_optimization": {
             "stage": 3,
             "contiguous_gradients": True,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": true
+            },
+            "offload_param": {
+                "device": "cpu",
+                "pin_memory": true
+            }
         },
         "checkpoint": {
             "async_io": False  # ✅ 启用异步 checkpoint 读写
@@ -57,3 +65,8 @@ if __name__ == "__main__":
     # with log_lock:
     #     my_logger.info(f"Final Checkpoint Load Time: {load_time:.2f}s")
     #     my_logger.handlers[0].flush()
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+    sys.exit(0)

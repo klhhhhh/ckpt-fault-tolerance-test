@@ -39,6 +39,14 @@ if __name__ == "__main__":
         "zero_optimization": {
             "stage": 3,
             "contiguous_gradients": True,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": true
+            },
+            "offload_param": {
+                "device": "cpu",
+                "pin_memory": true
+            }
         },
         "checkpoint": {
             "async_io": True  # ✅ 启用异步 checkpoint 读写
