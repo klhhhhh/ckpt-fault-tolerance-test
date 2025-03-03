@@ -4,13 +4,13 @@
 ## Therefore, DeepSpeed essentially automates the execution of `torch.distributed.launch` on each node and sets the `--nproc_per_node` parameter according to the `hostfile`.
 ## And we do not use srun command, directly use the command below on master node to run the program.
 deepspeed --num_nodes=4 --num_gpus=4 \
-    --master_addr="nid200317" \
+    --master_addr="nid200357" \
     --master_port=29501 \
     --hostfile="/global/homes/k/klhhhhh/ckpt-fault-tolerance-test/scripts/hostfile" \
     /global/homes/k/klhhhhh/ckpt-fault-tolerance-test/data_parallel/saving/multi_saving/llama-3.2-1B/async_io/train_fp16_async.py &> async_io_async_FP16_output.log
 
 deepspeed --num_nodes=4 --num_gpus=4 \
-    --master_addr="nid002512" \
+    --master_addr="nid200357" \
     --master_port=29501 \
     --hostfile="/global/homes/k/klhhhhh/ckpt-fault-tolerance-test/scripts/hostfile" \
     /global/homes/k/klhhhhh/ckpt-fault-tolerance-test/data_parallel/saving/multi_saving/llama-3.2-1B/async_io/train_fp16_sync.py &> async_io_sync_FP16_output.log

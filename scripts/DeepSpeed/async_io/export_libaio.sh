@@ -1,4 +1,9 @@
 export LD_LIBRARY_PATH=$HOME/local/lib:$LD_LIBRARY_PATH
 export C_INCLUDE_PATH=$HOME/local/include:$C_INCLUDE_PATH
+export CPLUS_INCLUDE_PATH=/local/include:$CPLUS_INCLUDE_PATH
 export CFLAGS="-I/global/homes/k/klhhhhh/local/include $CFLAGS"
+export CXXFLAGS="-I/global/homes/k/klhhhhh/local/include $CXXFLAGS"
 export LDFLAGS="-L/global/homes/k/klhhhhh/local/lib $LDFLAGS"
+export CPATH=/global/homes/k/klhhhhh/local/include:$CPATH
+export PATH=$HOME/gcc-12.3/bin:$PATH
+export LD_LIBRARY_PATH=$HOME/gcc-12.3/lib64:$LD_LIBRARY_PATH
