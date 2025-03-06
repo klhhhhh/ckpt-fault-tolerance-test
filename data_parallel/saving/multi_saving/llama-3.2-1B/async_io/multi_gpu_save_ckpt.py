@@ -69,7 +69,7 @@ def setup_logging(precision="FP32", mode="sync"):
     return my_logger
 
 # ✅ 训练（不存储 Checkpoint）
-def train_without_checkpoint(engine, dataloader, dtype, precision, log_lock=None, my_logger=None):
+def train_without_checkpoint(engine, dataloader, dtype, precision, my_logger=None):
     start_train_time = time.time()
 
     for step, (input_ids, attention_mask) in enumerate(dataloader):
@@ -86,13 +86,13 @@ def train_without_checkpoint(engine, dataloader, dtype, precision, log_lock=None
 
     total_train_time = time.time() - start_train_time
 
-    with log_lock:
-        my_logger.info(f"Training without checkpoint completed. Precision: {precision}")
-        my_logger.info(f"Total training time (No Checkpoint): {total_train_time:.2f}s")
-        my_logger.handlers[0].flush()
+
+    my_logger.info(f"Training without checkpoint completed. Precision: {precision}")
+    my_logger.info(f"Total training time (No Checkpoint): {total_train_time:.2f}s")
+    my_logger.handlers[0].flush()
 
 # ✅ 训练 + Checkpoint 逻辑
-def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, log_lock=None, my_logger=None):
+def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval, dtype, precision, my_logger=None):
     start_train_time = time.time()
     total_checkpoint_time = 0
 
@@ -120,21 +120,21 @@ def train_and_checkpoint(engine, dataloader, checkpoint_dir, checkpoint_interval
             total_checkpoint_time += checkpoint_time
 
             rank = engine.local_rank
-            with log_lock:
-                my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
-                               f"(Precision: {precision}, time={checkpoint_time:.2f}s)")
-                my_logger.handlers[0].flush()
+
+            my_logger.info(f"[GPU {rank}] [Step {step}] Checkpoint saved at {checkpoint_path} "
+                            f"(Precision: {precision}, time={checkpoint_time:.2f}s)")
+            my_logger.handlers[0].flush()
 
     total_train_time = time.time() - start_train_time
 
-    with log_lock:
-        my_logger.info(f"Training completed. Precision: {precision}")
-        my_logger.info(f"Total training time: {total_train_time:.2f}s")
-        my_logger.info(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
-        my_logger.handlers[0].flush()
+
+    my_logger.info(f"Training completed. Precision: {precision}")
+    my_logger.info(f"Total training time: {total_train_time:.2f}s")
+    my_logger.info(f"Total checkpoint time: {total_checkpoint_time:.2f}s")
+    my_logger.handlers[0].flush()
 
 # ✅  DeepSpeed Checkpoint Load
-def load_checkpoint(engine, checkpoint_dir, precision, log_lock=None, my_logger=None):
+def load_checkpoint(engine, checkpoint_dir, precision, my_logger=None):
     rank = engine.local_rank
     start_time = time.time()
 
@@ -144,55 +144,8 @@ def load_checkpoint(engine, checkpoint_dir, precision, log_lock=None, my_logger=
 
     load_time = time.time() - start_time
 
-    with log_lock:
-        my_logger.info(f"[GPU {rank}] Checkpoint loaded from {checkpoint_path} "
-                       f"(Precision: {precision}, Load Time: {load_time:.2f}s)")
-        my_logger.handlers[0].flush()
+    my_logger.info(f"[GPU {rank}] Checkpoint loaded from {checkpoint_path} "
+                    f"(Precision: {precision}, Load Time: {load_time:.2f}s)")
+    my_logger.handlers[0].flush()
 
     return load_time
-
-if __name__ == "__main__":
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-    manager = Manager()
-    log_lock = manager.Lock()
-
-    model_name = "/pscratch/sd/k/klhhhhh/Huggingface_model/Llama-3.2-1B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    dataset = DummyDataset(tokenizer, length=2000)
-    dataloader = DataLoader(dataset, batch_size=16)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-    checkpoint_dir = "/pscratch/sd/k/klhhhhh/deepspeed_checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    deepspeed_config = {
-        "train_batch_size": 256,
-        "train_micro_batch_size_per_gpu": 8,
-        "gradient_accumulation_steps": 2,
-        "zero_optimization": {
-            "stage": 3,
-            "contiguous_gradients": True,
-        },
-        "checkpoint": {
-            "async_io": True  # ✅ 启用异步 checkpoint 读写
-        },
-        "logging": {"verbosity": 0},
-        "bf16": {"enabled": False},
-        "fp16": {"enabled": False}
-    }
-
-    for precision, dtype in [("BF16", torch.bfloat16), ("FP16", torch.float16), ("FP32", torch.float32)]:
-        my_logger = setup_logging(precision)
-        deepspeed_config["fp16"]["enabled"] = precision == "FP16"
-        deepspeed_config["bf16"]["enabled"] = precision == "BF16"
-        model, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config_params=deepspeed_config)
-
-        train_without_checkpoint(model, dataloader, dtype, precision, log_lock, my_logger)
-        train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, log_lock=log_lock, my_logger=my_logger)
-        load_checkpoint(model, checkpoint_dir, precision, log_lock, my_logger)
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-    sys.exit(0)

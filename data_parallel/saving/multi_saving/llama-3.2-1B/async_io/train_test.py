@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from concurrent.futures import ThreadPoolExecutor
 import time
-from multiprocessing import Manager
 from multi_gpu_save_ckpt import train_and_checkpoint, train_without_checkpoint, DummyDataset, setup_logging, load_checkpoint
 
 if __name__ == "__main__":
@@ -19,13 +18,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A simple file processing script.")
     parser.add_argument("precision", type=str, help="The precision to use for training. Must be one of 'FP16', 'BF16', 'FP32'.")
     parser.add_argument("mode", type=str, help="The mode to use for training. Must be one of 'sync', 'async'.")
+    parser.add_argument("--local_rank", type=int, default=None, help="Local rank for distributed training")
 
     args = parser.parse_args()
     
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-    manager = Manager()
-    log_lock = manager.Lock()
 
     precision = args.precision
     dtype = torch.float16 if precision == "FP16" else torch.bfloat16 if precision == "BF16" else torch.float32
@@ -68,13 +65,12 @@ if __name__ == "__main__":
 
     my_logger = setup_logging(precision, mode)
     model, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config_params=deepspeed_config)
-    train_without_checkpoint(model, dataloader, dtype, precision, log_lock, my_logger)
-    train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=1, dtype=dtype, precision=precision, log_lock=log_lock, my_logger=my_logger)
-    # load_time = load_checkpoint(model, checkpoint_dir, precision, log_lock, my_logger)
+    train_without_checkpoint(model, dataloader, dtype, precision, my_logger)
+    train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=1, dtype=dtype, precision=precision, my_logger=my_logger)
+    # load_time = load_checkpoint(model, checkpoint_dir, precision, my_logger)
 
-    # with log_lock:
-    #     my_logger.info(f"Final Checkpoint Load Time: {load_time:.2f}s")
-    #     my_logger.handlers[0].flush()
+    # my_logger.info(f"Final Checkpoint Load Time: {load_time:.2f}s")
+    # my_logger.handlers[0].flush()
 
     if dist.is_initialized():
         dist.destroy_process_group()

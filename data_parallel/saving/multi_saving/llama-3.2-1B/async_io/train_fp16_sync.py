@@ -39,14 +39,15 @@ if __name__ == "__main__":
         "zero_optimization": {
             "stage": 3,
             "contiguous_gradients": True,
-            "offload_optimizer": {
-                "device": "cpu",
-                "pin_memory": true
-            },
-            "offload_param": {
-                "device": "cpu",
-                "pin_memory": true
-            }
+            # "offload_optimizer": {
+            #     "device": "cpu",
+            #     "pin_memory": True
+            # },
+            # "offload_param": {
+            #     "device": "cpu",
+            #     "pin_memory": True
+            # }
+            # "offload_grads": True
         },
         "checkpoint": {
             "async_io": False  # ✅ 启用异步 checkpoint 读写
@@ -59,7 +60,7 @@ if __name__ == "__main__":
     my_logger = setup_logging(precision, "sync")
     model, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config_params=deepspeed_config)
     train_without_checkpoint(model, dataloader, dtype, precision, log_lock, my_logger)
-    train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, log_lock=log_lock, my_logger=my_logger)
+    train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=1, dtype=dtype, precision=precision, log_lock=log_lock, my_logger=my_logger)
     # load_time = load_checkpoint(model, checkpoint_dir, precision, log_lock, my_logger)
     
     # with log_lock:
