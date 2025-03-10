@@ -41,7 +41,7 @@ if __name__ == "__main__":
     model_name = "/pscratch/sd/k/klhhhhh/Huggingface_model/Llama-3.2-1B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(model_name)
-    dataset = DummyDataset(tokenizer, length=2000)
+    dataset = DummyDataset(tokenizer, length=6000)
     dataloader = DataLoader(dataset, batch_size=16)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
     checkpoint_dir = "/pscratch/sd/k/klhhhhh/deepspeed_checkpoints/fp16"
@@ -53,7 +53,7 @@ if __name__ == "__main__":
     train_without_checkpoint(model, dataloader, dtype, precision, log_lock, my_logger)
 
     for mode in ["sync", "async"]:
-        train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=10, dtype=dtype, precision=precision, mode=mode, log_lock=log_lock, my_logger=my_logger)
+        train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=20, dtype=dtype, precision=precision, mode=mode, log_lock=log_lock, my_logger=my_logger)
 
     load_time = load_checkpoint(model, checkpoint_dir, precision, log_lock, my_logger)
 

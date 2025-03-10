@@ -60,8 +60,8 @@ def setup_logging(precision="FP32"):
     my_logger = logging.getLogger(f"my_logger_{node_rank}_{local_rank}")
     my_logger.setLevel(logging.INFO)
 
-    os.makedirs(f"./logs/{precision}/", exist_ok=True)
-    log_filename = f"./logs/{precision}/my_logs_node{node_rank}_gpu{local_rank}.log"
+    os.makedirs(f"./logs/multi_processing/{precision}/", exist_ok=True)
+    log_filename = f"./logs/multi_processing/{precision}/my_logs_node{node_rank}_gpu{local_rank}.log"
 
     my_handler = logging.FileHandler(log_filename, mode="w")
     formatter = LogFormatter(precision)

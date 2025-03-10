@@ -6,6 +6,7 @@ import deepspeed
 import logging
 import torch.multiprocessing as mp
 import argparse
+import torch.cuda.profiler as profiler
 
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -62,11 +63,13 @@ if __name__ == "__main__":
         "bf16": {"enabled": False},
         "fp16": {"enabled": True}
     }
-    print(mode)
+
     my_logger = setup_logging(precision, mode)
     model, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config_params=deepspeed_config)
+    profiler.cudaProfilerStart()
     train_without_checkpoint(model, dataloader, dtype, precision, my_logger)
     train_and_checkpoint(model, dataloader, checkpoint_dir, checkpoint_interval=1, dtype=dtype, precision=precision, my_logger=my_logger)
+    profiler.cudaProfilerStop()
     # load_time = load_checkpoint(model, checkpoint_dir, precision, my_logger)
 
     # my_logger.info(f"Final Checkpoint Load Time: {load_time:.2f}s")
